@@ -2,6 +2,20 @@ from fastapi import FastAPI, HTTPException, status, Depends
 from typing import Optional, List
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+import jwt
+from passlib.context import CryptContext
+
+# ---------------------------------------------------------
+# SECURITY CONFIGURATION
+# ---------------------------------------------------------
+SECRET_KEY = "super-secret-key-change-this-in-production"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # 1. Database Connection & Engine Setup
 sqlite_file_name = "ecommerce.db"
@@ -22,6 +36,113 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
+
+# USER MODELS & SCHEMAS
+class User(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    username: str = Field(index=True, unique=True)
+    hashed_password: str
+    role: str = Field(default="user")  # "user" or "admin"
+
+class UserRegister(SQLModel):
+    username: str
+    password: str
+    role: Optional[str] = "user"
+
+class UserResponse(SQLModel):
+    id: int
+    username: str
+    role: str
+
+# ---------------------------------------------------------
+# PASSWORD & TOKEN HELPERS
+# ---------------------------------------------------------
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+# ---------------------------------------------------------
+# AUTH DEPENDENCIES
+# ---------------------------------------------------------
+def get_current_user(
+    token: str = Depends(oauth2_scheme), 
+    session: Session = Depends(get_session)
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+
+    statement = select(User).where(User.username == username)
+    user = session.exec(statement).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required"
+        )
+    return current_user
+
+
+# ---------------------------------------------------------
+# AUTH ROUTES
+# ---------------------------------------------------------
+@app.post("/register", response_model=UserResponse)
+def register(user_data: UserRegister, session: Session = Depends(get_session)):
+    # 1. Check if username already exists in SQLite
+    statement = select(User).where(User.username == user_data.username)
+    if session.exec(statement).first():
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    # 2. Hash raw password and create new User database row
+    new_user = User(
+        username=user_data.username,
+        hashed_password=hash_password(user_data.password),
+        role=user_data.role if user_data.role in ["user", "admin"] else "user"
+    )
+    session.add(new_user)
+    session.commit()
+    session.refresh(new_user)
+    
+    # 3. Return user (filtered by UserResponse to exclude hashed_password)
+    return new_user
+
+@app.post("/login")
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(), 
+    session: Session = Depends(get_session)
+):
+    # 1. Look up user by username in SQLite
+    statement = select(User).where(User.username == form_data.username)
+    user = session.exec(statement).first()
+    
+    # 2. Verify password hash
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    
+    # 3. Create signed 60-minute JWT token
+    access_token = create_access_token(data={"sub": user.username, "role": user.role})
+    return {"access_token": access_token, "token_type": "bearer"}
 
 # 2. Database Models & Schemas
 class ProductCreate(SQLModel):
@@ -49,7 +170,7 @@ class Order(SQLModel, table=True):
 
 
 # 1. CREATE PRODUCT
-@app.post('/product')
+@app.post('/product', dependencies=[Depends(require_admin)])
 def create_product(product_data: ProductCreate, session: Session = Depends(get_session)):
     db_product = Product.model_validate(product_data)
     session.add(db_product)
@@ -76,7 +197,7 @@ def read_id(product_id: int, session: Session = Depends(get_session)):
     return product
 
 # 4. UPDATE / RESTOCK PRODUCT
-@app.put('/product/{product_id}')
+@app.put('/product/{product_id}', dependencies=[Depends(require_admin)])
 def update_product(product_id: int, updated_data: ProductCreate, session: Session = Depends(get_session)):
     db_product = session.get(Product, product_id)
     if not db_product:
@@ -92,7 +213,7 @@ def update_product(product_id: int, updated_data: ProductCreate, session: Sessio
     return db_product 
 
 # 5. DELETE PRODUCT
-@app.delete('/product/{product_id}')
+@app.delete('/product/{product_id}', dependencies=[Depends(require_admin)])
 def delete_product(product_id: int, session: Session = Depends(get_session)):
     db_product = session.get(Product, product_id)
     if not db_product:
@@ -108,7 +229,9 @@ def delete_product(product_id: int, session: Session = Depends(get_session)):
 
 # 1. CREATE ORDER
 @app.post('/order')
-def create_order(order_data: OrderCreate, session: Session = Depends(get_session)):
+def create_order(order_data: OrderCreate, 
+                 session: Session = Depends(get_session), 
+                 current_user: User = Depends(get_current_user)): # Enforces that the user is logged in
     # Fetch product from SQLite database
     product = session.get(Product, order_data.Product_id)
     if not product:
